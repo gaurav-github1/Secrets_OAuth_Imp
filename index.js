@@ -6,34 +6,45 @@ import passport from "passport";
 import { Strategy } from "passport-local";
 import GoogleStrategy from "passport-google-oauth2";
 import session from "express-session";
+import pgSession from "connect-pg-simple";
 import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 const saltRounds = 10;
+const PgStore = pgSession(session);
 
+// Database connection
+const db = new pg.Client({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+db.connect();
+
+// Session configuration with PostgreSQL store
 app.use(
   session({
+    store: new PgStore({
+      connectionString: process.env.DATABASE_URL,
+      tableName: 'sessions',
+      createTableIfMissing: true,
+    }),
     secret: process.env.SESSION_SECRET,
     resave: false,
-    saveUninitialized: true,
+    saveUninitialized: false,
+    cookie: {
+      maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+      secure: process.env.NODE_ENV === 'production',
+    }
   })
 );
+
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static("public"));
 
 app.use(passport.initialize());
 app.use(passport.session());
-
-const db = new pg.Client({
-  user: process.env.PG_USER,
-  host: process.env.PG_HOST,
-  database: process.env.PG_DATABASE,
-  password: process.env.PG_PASSWORD,
-  port: process.env.PG_PORT,
-});
-db.connect();
 
 app.get("/", (req, res) => {
   res.render("home.ejs");
@@ -58,15 +69,12 @@ app.get("/logout", (req, res) => {
 
 app.get("/secrets", async (req, res) => {
   if (req.isAuthenticated()) {
-    //TODO: Update this to pull in the user secret to render in secrets.ejs
-    // console.log(req.user);
     try {
       const result = await db.query(
         "SELECT secret FROM users WHERE email = $1",
         [req.user.email]
       );
       const secret = result.rows[0].secret;
-      // console.log(secret);
       if (secret) {
         res.render("secrets.ejs", { secret: secret });
       } else {
@@ -82,9 +90,6 @@ app.get("/secrets", async (req, res) => {
   }
 });
 
-//TODO: Add a get route for the submit button
-//Think about how the logic should work with authentication.
-
 app.get("/submit", (req, res) => {
   if (req.isAuthenticated()) {
     res.render("submit.ejs");
@@ -93,6 +98,7 @@ app.get("/submit", (req, res) => {
   }
 });
 
+// Google OAuth routes
 app.get(
   "/auth/google",
   passport.authenticate("google", {
@@ -126,7 +132,7 @@ app.post("/register", async (req, res) => {
     ]);
 
     if (checkResult.rows.length > 0) {
-      req.redirect("/login");
+      res.redirect("/login"); // Fixed typo: req.redirect -> res.redirect
     } else {
       bcrypt.hash(password, saltRounds, async (err, hash) => {
         if (err) {
@@ -149,13 +155,9 @@ app.post("/register", async (req, res) => {
   }
 });
 
-//TODO: Create the post route for submit.
-//Handle the submitted data and add it to the database
-
 app.post("/submit", async (req, res) => {
   const secret = req.body.secret;
   const email = req.user.email;
-  // console.log(email);
   try {
     const result = await db.query(
       "UPDATE users SET secret = $1 WHERE email = $2",
@@ -167,6 +169,7 @@ app.post("/submit", async (req, res) => {
   }
 });
 
+// Local strategy setup
 passport.use(
   "local",
   new Strategy(async function verify(username, password, cb) {
@@ -198,13 +201,14 @@ passport.use(
   })
 );
 
+// Google strategy setup with dynamic callback URL
 passport.use(
   "google",
   new GoogleStrategy(
     {
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      callbackURL: "http://localhost:3000/auth/google/secrets",
+      callbackURL: process.env.GOOGLE_CALLBACK_URL || "http://localhost:3000/auth/google/secrets",
       userProfileURL: "https://www.googleapis.com/oauth2/v3/userinfo",
     },
     async (accessToken, refreshToken, profile, cb) => {
@@ -228,6 +232,7 @@ passport.use(
     }
   )
 );
+
 passport.serializeUser((user, cb) => {
   cb(null, user);
 });
