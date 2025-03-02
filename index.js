@@ -20,17 +20,52 @@ const db = new pg.Client({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
-db.connect();
+
+// Create the sessions table before starting the application
+async function initialize() {
+  try {
+    await db.connect();
+    
+    // Create sessions table if it doesn't exist
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS "sessions" (
+        "sid" varchar NOT NULL,
+        "sess" json NOT NULL,
+        "expire" timestamp(6) NOT NULL,
+        CONSTRAINT "sessions_pkey" PRIMARY KEY ("sid")
+      )
+    `);
+    
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS "IDX_sessions_expire" ON "sessions" ("expire")
+    `);
+    
+    // Create users table if it doesn't exist
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS "users" (
+        "id" SERIAL PRIMARY KEY,
+        "email" varchar(255) UNIQUE NOT NULL,
+        "password" varchar(255) NOT NULL,
+        "secret" text
+      )
+    `);
+    
+    console.log("Database tables initialized successfully");
+  } catch (error) {
+    console.error("Database initialization error:", error);
+    process.exit(1);
+  }
+}
 
 // Session configuration with PostgreSQL store
 app.use(
   session({
     store: new PgStore({
-      connectionString: process.env.DATABASE_URL,
+      pool: db,
       tableName: 'sessions',
       createTableIfMissing: true,
     }),
-    secret: process.env.SESSION_SECRET,
+    secret: process.env.SESSION_SECRET || 'your-secret-key',
     resave: false,
     saveUninitialized: false,
     cookie: {
@@ -74,7 +109,7 @@ app.get("/secrets", async (req, res) => {
         "SELECT secret FROM users WHERE email = $1",
         [req.user.email]
       );
-      const secret = result.rows[0].secret;
+      const secret = result.rows[0]?.secret;
       if (secret) {
         res.render("secrets.ejs", { secret: secret });
       } else {
@@ -84,6 +119,7 @@ app.get("/secrets", async (req, res) => {
       }
     } catch (error) {
       console.log(error);
+      res.status(500).send("An error occurred");
     }
   } else {
     res.redirect("/login");
@@ -132,11 +168,12 @@ app.post("/register", async (req, res) => {
     ]);
 
     if (checkResult.rows.length > 0) {
-      res.redirect("/login"); // Fixed typo: req.redirect -> res.redirect
+      res.redirect("/login");
     } else {
       bcrypt.hash(password, saltRounds, async (err, hash) => {
         if (err) {
           console.error("Error hashing password:", err);
+          res.status(500).send("Registration failed");
         } else {
           const result = await db.query(
             "INSERT INTO users (email, password) VALUES ($1, $2) RETURNING *",
@@ -144,7 +181,10 @@ app.post("/register", async (req, res) => {
           );
           const user = result.rows[0];
           req.login(user, (err) => {
-            console.log("success");
+            if (err) {
+              console.error("Login after registration failed:", err);
+              return res.status(500).send("Login after registration failed");
+            }
             res.redirect("/secrets");
           });
         }
@@ -152,6 +192,7 @@ app.post("/register", async (req, res) => {
     }
   } catch (err) {
     console.log(err);
+    res.status(500).send("Registration failed");
   }
 });
 
@@ -159,13 +200,14 @@ app.post("/submit", async (req, res) => {
   const secret = req.body.secret;
   const email = req.user.email;
   try {
-    const result = await db.query(
+    await db.query(
       "UPDATE users SET secret = $1 WHERE email = $2",
       [secret, email]
     );
     res.redirect("/secrets");
   } catch (error) {
     console.log(error);
+    res.status(500).send("Failed to save secret");
   }
 });
 
@@ -174,12 +216,18 @@ passport.use(
   "local",
   new Strategy(async function verify(username, password, cb) {
     try {
-      const result = await db.query("SELECT * FROM users WHERE email = $1 ", [
+      const result = await db.query("SELECT * FROM users WHERE email = $1", [
         username,
       ]);
       if (result.rows.length > 0) {
         const user = result.rows[0];
         const storedHashedPassword = user.password;
+        
+        // Handle Google-authenticated users
+        if (storedHashedPassword === "google") {
+          return cb(null, false, { message: "Please use Google login for this account" });
+        }
+        
         bcrypt.compare(password, storedHashedPassword, (err, valid) => {
           if (err) {
             console.error("Error comparing passwords:", err);
@@ -188,15 +236,16 @@ passport.use(
             if (valid) {
               return cb(null, user);
             } else {
-              return cb(null, false);
+              return cb(null, false, { message: "Incorrect password" });
             }
           }
         });
       } else {
-        return cb("User not found");
+        return cb(null, false, { message: "User not found" });
       }
     } catch (err) {
       console.log(err);
+      return cb(err);
     }
   })
 );
@@ -213,13 +262,13 @@ passport.use(
     },
     async (accessToken, refreshToken, profile, cb) => {
       try {
-        console.log(profile);
+        console.log("Google profile:", profile.email);
         const result = await db.query("SELECT * FROM users WHERE email = $1", [
           profile.email,
         ]);
         if (result.rows.length === 0) {
           const newUser = await db.query(
-            "INSERT INTO users (email, password) VALUES ($1, $2)",
+            "INSERT INTO users (email, password) VALUES ($1, $2) RETURNING *",
             [profile.email, "google"]
           );
           return cb(null, newUser.rows[0]);
@@ -227,6 +276,7 @@ passport.use(
           return cb(null, result.rows[0]);
         }
       } catch (err) {
+        console.error("Google authentication error:", err);
         return cb(err);
       }
     }
@@ -241,6 +291,11 @@ passport.deserializeUser((user, cb) => {
   cb(null, user);
 });
 
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+// Initialize database and start server
+initialize().then(() => {
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
+}).catch(err => {
+  console.error("Failed to start application:", err);
 });
